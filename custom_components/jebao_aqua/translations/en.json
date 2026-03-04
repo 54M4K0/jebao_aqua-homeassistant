@@ -1,6 +1,5 @@
 {
   "config": {
-    "title": "Jebao Aquarium Pumps",
     "step": {
       "user": {
         "title": "Log in to Jebao",
@@ -39,7 +38,6 @@
     }
   },
   "options": {
-    "title": "Jebao Aquarium Pumps Options",
     "step": {
       "init": {
         "title": "Configure Jebao Aquarium Pumps",

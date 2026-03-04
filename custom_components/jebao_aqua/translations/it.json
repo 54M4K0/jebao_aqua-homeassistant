@@ -1,6 +1,5 @@
 {
   "config": {
-    "title": "Pompe per acquario Jebao",
     "step": {
       "user": {
         "title": "Accedi a Jebao",
@@ -39,7 +38,6 @@
     }
   },
   "options": {
-    "title": "Opzioni Pompe Acquario Jebao",
     "step": {
       "init": {
         "title": "Configura Pompe Jebao",
