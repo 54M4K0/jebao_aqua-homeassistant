@@ -1,5 +1,9 @@
 # Jebao Aqua - Home Assistant Integration
 
+<p align="center">
+  <img src="logo.png" alt="Jebao Aqua" width="300">
+</p>
+
 [![HACS Validation](https://github.com/ergo5/jebao_aqua-homeassistant/actions/workflows/hacs-validate.yml/badge.svg)](https://github.com/ergo5/jebao_aqua-homeassistant/actions/workflows/hacs-validate.yml)
 [![hassfest Validation](https://github.com/ergo5/jebao_aqua-homeassistant/actions/workflows/hassfest.yml/badge.svg)](https://github.com/ergo5/jebao_aqua-homeassistant/actions/workflows/hassfest.yml)
 
