@@ -1,104 +1,128 @@
+"""Select platform for Jebao Aqua."""
+
+from __future__ import annotations
+
 from homeassistant.components.select import SelectEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
 from .const import DOMAIN, LOGGER
 from .helpers import (
     get_device_info,
-    create_entity_name,
-    create_entity_id,
-    create_unique_id,
-    is_device_data_valid,
-    get_attribute_value,
+    get_model_attrs,
+    is_hidden_attr,
+    make_entity_id,
+    make_entity_name,
+    make_unique_id,
+    safe_get_attr_value,
+    translate_enum_value,
 )
 
 
-class JebaoPumpSelect(CoordinatorEntity, SelectEntity):
-    """Representation of a Jebao Pump Select Entity."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Jebao select entities."""
+    data = hass.data[DOMAIN][entry.entry_id]
+    coordinator = data["coordinator"]
+    attribute_models = data["attribute_models"]
 
-    def __init__(self, coordinator, device, attribute):
+    entities: list[JebaoPumpSelect] = []
+
+    for device in coordinator.device_inventory:
+        product_key = device.get("product_key")
+        model = attribute_models.get(product_key) if product_key else None
+        if not model:
+            continue
+
+        for attr in get_model_attrs(model):
+            if (
+                attr.get("type") == "status_writable"
+                and attr.get("data_type") == "enum"
+            ):
+                entities.append(JebaoPumpSelect(coordinator, device, attr))
+
+    if entities:
+        async_add_entities(entities)
+        LOGGER.debug("Added %d select entities", len(entities))
+
+
+class JebaoPumpSelect(CoordinatorEntity, SelectEntity):
+    """Representation of a Jebao Pump selectable option."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, device: dict, attribute: dict) -> None:
+        """Initialize the select entity."""
         super().__init__(coordinator)
         self._device = device
         self._attribute = attribute
-        device_id = device.get("did")
-        device_name = device.get("dev_alias") or device.get("did")
+        self._device_id = device["did"]
+        self._attr_name_key = attribute["name"]
 
-        # Use helper functions for consistent entity properties
-        self._attr_name = create_entity_name(device_name, attribute["display_name"])
-        self._attr_unique_id = create_unique_id(device_id, attribute["name"])
-        self.entity_id = create_entity_id("select", device_name, attribute["name"])
+        self._attr_name = make_entity_name(
+            attribute.get("display_name", attribute["name"])
+        )
+        self._attr_unique_id = make_unique_id(self._device_id, self._attr_name_key)
+        self.entity_id = make_entity_id("select", self._device_id, self._attr_name_key)
 
-        # Mapping the enum values to their descriptions
-        self._option_mapping = dict(zip(attribute["desc"], attribute["enum"]))
-        self._options = list(self._option_mapping.keys())
+        # Hide raw firmware attrs managed by smart dosing
+        if is_hidden_attr(self._attr_name_key):
+            self._attr_entity_registry_enabled_default = False
+
+        # Enum options — translate CN to EN for display
+        self._enum_values: list[str] = attribute.get("enum", [])
+        self._translated_options = [translate_enum_value(v) for v in self._enum_values]
+        # Reverse map: EN option -> CN firmware value
+        self._option_to_firmware = dict(
+            zip(self._translated_options, self._enum_values)
+        )
+        self._firmware_to_option = dict(
+            zip(self._enum_values, self._translated_options)
+        )
+        self._attr_options = list(self._translated_options)
+
+    @property
+    def device_info(self):
+        """Return device info."""
+        return get_device_info(self._device)
+
+    @property
+    def current_option(self) -> str | None:
+        """Return the current selected option (translated)."""
+        value = safe_get_attr_value(
+            self.coordinator.data, self._device_id, self._attr_name_key
+        )
+        if value is not None and value in self._firmware_to_option:
+            return self._firmware_to_option[value]
+        return None
 
     @property
     def available(self) -> bool:
-        """Return if entity is available."""
-        device_data = self.coordinator.device_data.get(self._device["did"])
-        return is_device_data_valid(device_data)
-
-    @property
-    def current_option(self):
-        """Return the current selected option."""
-        device_data = self.coordinator.device_data.get(self._device["did"])
-        current_value = get_attribute_value(device_data, self._attribute["name"])
-        return next(
-            (
-                desc
-                for desc, value in self._option_mapping.items()
-                if value == current_value
-            ),
-            None,
+        """Return True if entity is available."""
+        return self.coordinator.last_update_success and self._device_id in (
+            self.coordinator.data or {}
         )
 
-    async def async_select_option(self, option: str):
-        """Change the selected option."""
-        # Convert the English description back to the enum value for the API call
-        enum_value = self._option_mapping.get(option)
+    async def async_select_option(self, option: str) -> None:
+        """Handle option selection — translate EN back to CN for firmware."""
+        firmware_value = self._option_to_firmware.get(option)
+        if firmware_value is None:
+            LOGGER.warning("Invalid option %s for %s", option, self._attr_name_key)
+            return
+
+        # Send the enum index as the value
+        enum_index = self._enum_values.index(firmware_value)
         await self.coordinator.api.control_device(
-            self._device["did"], {self._attribute["name"]: enum_value}
+            self._device_id, {self._attr_name_key: enum_index}
         )
         await self.coordinator.async_request_refresh()
 
     @property
-    def options(self):
-        """Return a set of selectable options."""
-        return self._options
-
-    @property
-    def device_info(self):
-        """Return information about the device this entity belongs to."""
-        return get_device_info(self._device)
-
-    @property
-    def name(self) -> str:
-        """Return the display name of this entity."""
-        return self._attr_name
-
-    @property
-    def has_entity_name(self) -> bool:
-        """Indicate that we are using the device name as the entity name."""
-        return True
-
-    @property
     def translation_key(self) -> str:
-        """Return the translation key to use in logbook."""
-        return self._attribute["name"].lower()
-
-
-async def async_setup_entry(hass, entry, async_add_entities):
-    """Set up Jebao Pump select entities."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    attribute_models = hass.data[DOMAIN][entry.entry_id]["attribute_models"]
-
-    selects = []
-    for device in coordinator.device_inventory:
-        LOGGER.debug("Device structure: %s", device)
-        product_key = device.get("product_key")
-        model = attribute_models.get(product_key)
-
-        if model:
-            for attr in model["attrs"]:
-                if attr["type"] == "status_writable" and attr["data_type"] == "enum":
-                    selects.append(JebaoPumpSelect(coordinator, device, attr))
-
-    async_add_entities(selects)
+        """Return translation key."""
+        return self._attr_name_key.lower()

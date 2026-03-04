@@ -1,0 +1,23 @@
+# APK files
+*.xapk
+*.apk
+
+# IDE / workspace
+*.code-workspace
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Temp files
+*.tmp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

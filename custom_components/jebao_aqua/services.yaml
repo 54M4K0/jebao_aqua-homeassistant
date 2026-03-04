@@ -1,0 +1,58 @@
+set_dosing_schedule:
+  name: Set Dosing Schedule
+  description: >
+    Program a dosing channel with a daily schedule. The pump will run
+    autonomously after programming — no HA connection needed.
+  fields:
+    channel:
+      name: Channel
+      description: Dosing channel number (1-8)
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 8
+          step: 1
+          mode: slider
+    daily_ml:
+      name: Daily Volume (ml)
+      description: Total volume to dose per day in milliliters
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 9999
+          step: 1
+          unit_of_measurement: ml
+    doses_per_day:
+      name: Doses per Day
+      description: >
+        How many times to dose per day (evenly distributed).
+        E.g. 24 = once per hour, 12 = every 2 hours, 1 = once daily.
+        Minimum dose per slot is 1ml, so this cannot exceed daily_ml.
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 24
+          step: 1
+          mode: slider
+    day_interval:
+      name: Day Interval
+      description: >
+        Days to skip between dosing days (firmware-native, runs offline).
+        0 = dose every day, 1 = every other day, 2 = every 3rd day, etc.
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 30
+          step: 1
+    enable:
+      name: Enable Timer
+      description: Enable the dosing timer after programming
+      required: false
+      default: true
+      selector:
+        boolean:

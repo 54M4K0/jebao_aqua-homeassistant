@@ -1,95 +1,116 @@
+"""Switch platform for Jebao Aqua."""
+
+from __future__ import annotations
+
+from typing import Any
+
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+
 from .const import DOMAIN, LOGGER
 from .helpers import (
     get_device_info,
-    create_entity_name,
-    create_entity_id,
-    create_unique_id,
-    is_device_data_valid,
-    get_attribute_value,
+    get_model_attrs,
+    is_hidden_attr,
+    make_entity_id,
+    make_entity_name,
+    make_unique_id,
+    safe_get_attr_value,
 )
-import asyncio
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Jebao switch entities."""
+    data = hass.data[DOMAIN][entry.entry_id]
+    coordinator = data["coordinator"]
+    attribute_models = data["attribute_models"]
+
+    entities: list[JebaoPumpSwitch] = []
+
+    for device in coordinator.device_inventory:
+        product_key = device.get("product_key")
+        model = attribute_models.get(product_key) if product_key else None
+        if not model:
+            continue
+
+        for attr in get_model_attrs(model):
+            if (
+                attr.get("type") == "status_writable"
+                and attr.get("data_type") == "bool"
+            ):
+                entities.append(JebaoPumpSwitch(coordinator, device, attr))
+
+    if entities:
+        async_add_entities(entities)
+        LOGGER.debug("Added %d switch entities", len(entities))
 
 
 class JebaoPumpSwitch(CoordinatorEntity, SwitchEntity):
-    """Representation of a Jebao Pump Switch."""
+    """Representation of a Jebao Pump boolean switch."""
 
-    def __init__(self, coordinator, device, attribute):
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, device: dict, attribute: dict) -> None:
+        """Initialize the switch."""
         super().__init__(coordinator)
         self._device = device
         self._attribute = attribute
-        device_id = device.get("did")
-        device_name = device.get("dev_alias") or device.get("did")
+        self._device_id = device["did"]
+        self._attr_name_key = attribute["name"]
 
-        # Use helper functions for consistent entity properties
-        self._attr_name = create_entity_name(device_name, attribute["display_name"])
-        self._attr_unique_id = create_unique_id(device_id, attribute["name"])
-        self.entity_id = create_entity_id("switch", device_name, attribute["name"])
-
-    @property
-    def available(self) -> bool:
-        """Return if entity is available."""
-        device_data = self.coordinator.device_data.get(self._device["did"])
-        return is_device_data_valid(device_data)
-
-    @property
-    def is_on(self) -> bool:
-        """Return the on/off state of the switch."""
-        device_data = self.coordinator.device_data.get(self._device["did"])
-        return get_attribute_value(device_data, self._attribute["name"]) or False
-
-    async def async_turn_on(self, **kwargs):
-        """Turn the switch on."""
-        await self.coordinator.api.control_device(
-            self._device["did"], {self._attribute["name"]: True}
+        self._attr_name = make_entity_name(
+            attribute.get("display_name", attribute["name"])
         )
-        await asyncio.sleep(3)  # Wait for 3 seconds
-        await self.coordinator.async_request_refresh()
+        self._attr_unique_id = make_unique_id(self._device_id, self._attr_name_key)
+        self.entity_id = make_entity_id("switch", self._device_id, self._attr_name_key)
 
-    async def async_turn_off(self, **kwargs):
-        """Turn the switch off."""
-        await self.coordinator.api.control_device(
-            self._device["did"], {self._attribute["name"]: False}
-        )
-        await asyncio.sleep(3)  # Wait for 3 seconds
-        await self.coordinator.async_request_refresh()
+        # Hide raw firmware attrs managed by smart dosing
+        if is_hidden_attr(self._attr_name_key):
+            self._attr_entity_registry_enabled_default = False
 
     @property
     def device_info(self):
-        """Return information about the device this entity belongs to."""
+        """Return device info."""
         return get_device_info(self._device)
 
     @property
-    def name(self) -> str:
-        """Return the display name of this entity."""
-        return self._attr_name
+    def is_on(self) -> bool | None:
+        """Return the on/off state."""
+        value = safe_get_attr_value(
+            self.coordinator.data, self._device_id, self._attr_name_key
+        )
+        return bool(value) if value is not None else None
 
     @property
-    def has_entity_name(self) -> bool:
-        """Indicate that we are using the device name as the entity name."""
-        return True
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return self.coordinator.last_update_success and self._device_id in (
+            self.coordinator.data or {}
+        )
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Turn the switch on."""
+        await self.coordinator.api.control_device(
+            self._device_id, {self._attr_name_key: True}
+        )
+        # Optimistic update — immediately reflect state
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Turn the switch off."""
+        await self.coordinator.api.control_device(
+            self._device_id, {self._attr_name_key: False}
+        )
+        await self.coordinator.async_request_refresh()
 
     @property
     def translation_key(self) -> str:
-        """Return the translation key to use in logbook."""
-        return self._attribute["name"].lower()
-
-
-async def async_setup_entry(hass, entry, async_add_entities):
-    """Set up the Jebao Pump switch entities."""
-    coordinator = hass.data[DOMAIN][entry.entry_id]["coordinator"]
-    attribute_models = hass.data[DOMAIN][entry.entry_id]["attribute_models"]
-
-    switches = []
-    for device in coordinator.device_inventory:  # Use device_inventory for the setup
-        LOGGER.debug("Device structure: %s", device)
-        product_key = device.get("product_key")
-        model = attribute_models.get(product_key)
-
-        if model:
-            for attr in model["attrs"]:
-                if attr["type"] == "status_writable" and attr["data_type"] == "bool":
-                    switches.append(JebaoPumpSwitch(coordinator, device, attr))
-
-    async_add_entities(switches)
+        """Return translation key."""
+        return self._attr_name_key.lower()

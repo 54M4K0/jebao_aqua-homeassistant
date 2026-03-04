@@ -1,16 +1,17 @@
-"""Constants for the Jebao Aqua Pump integration."""
+"""Constants for the Jebao Aqua integration."""
+
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
 
 DOMAIN = "jebao_aqua"
-# Logger
-import logging
-
 LOGGER = logging.getLogger(__package__)
 
-# API constants
-GIZWITS_APP_ID = "c3703c4888ec4736a3a0d9425c321604"  # This is used by the Android app, iOS may use a different one?
+# --- Gizwits Cloud API ---
+GIZWITS_APP_ID = "c3703c4888ec4736a3a0d9425c321604"
 
-# Gizwits API URLs by Region
-GIZWITS_API_URLS = {
+GIZWITS_API_URLS: dict[str, dict[str, str]] = {
     "eu": {
         "LOGIN_URL": "https://euaepapp.gizwits.com/app/smart_home/login/pwd",
         "DEVICES_URL": "https://euapi.gizwits.com/app/bindings",
@@ -31,24 +32,31 @@ GIZWITS_API_URLS = {
     },
 }
 
-TIMEOUT = 10
-DISCOVERY_TIMEOUT = 5  # seconds
-
+# --- Network ---
 LAN_PORT = 12416
+DISCOVERY_PORT = 12414
+TIMEOUT = 10
+DISCOVERY_TIMEOUT = 5
 
-# Update interval
-from datetime import timedelta
+# --- Update ---
+DEFAULT_UPDATE_INTERVAL = 10  # seconds
+UPDATE_INTERVAL = timedelta(seconds=DEFAULT_UPDATE_INTERVAL)
+MAX_LAN_FAILURES = 5  # Fallback to cloud after N consecutive LAN failures
 
-UPDATE_INTERVAL = timedelta(seconds=2)
+# --- Platforms ---
+PLATFORMS: list[str] = [
+    "binary_sensor",
+    "number",
+    "select",
+    "sensor",
+    "switch",
+]
 
-# Platform types
-PLATFORMS = ["switch", "sensor", "select", "number"]
-
-# Default Region (used if no region is specified)
+# --- Defaults ---
 DEFAULT_REGION = "eu"
 
-# Service Map (Country Code to Region)
-SERVICE_MAP = {
+# --- Service Map (Country Code to Gizwits Region) ---
+SERVICE_MAP: dict[str, str] = {
     "CN": "cn",
     "JP": "us",
     "US": "us",

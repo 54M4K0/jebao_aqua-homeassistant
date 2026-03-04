@@ -1,65 +1,46 @@
+"""The Jebao Aqua integration."""
+
+from __future__ import annotations
+
 import asyncio
 import json
+from pathlib import Path
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.config_entries import ConfigEntries  # Add this import
-import async_timeout
-from pathlib import Path
-from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
-from homeassistant.helpers.device_registry import async_get as async_get_device_registry
+from homeassistant.helpers.update_coordinator import (
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
 
-from .const import DOMAIN, PLATFORMS, UPDATE_INTERVAL, LOGGER, GIZWITS_API_URLS
 from .api import GizwitsApi
+from .const import (
+    DOMAIN,
+    GIZWITS_API_URLS,
+    LOGGER,
+    MAX_LAN_FAILURES,
+    PLATFORMS,
+    UPDATE_INTERVAL,
+)
 from .discovery import discover_devices
-from .helpers import is_device_data_valid  # Add this import
-
-PLATFORMS = ["switch", "binary_sensor", "select", "number"]
-
-
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Set up the Jebao Pump component."""
-    hass.data[DOMAIN] = {}  # Initialize the DOMAIN space in hass.data
-    return True
+from .helpers import is_device_data_valid
+from .services import async_setup_services, async_unload_services
 
 
-async def load_attribute_models(hass: HomeAssistant) -> dict:
-    """Load attribute models asynchronously."""
-    models_path = Path(hass.config.path("custom_components/jebao_aqua/models"))
-    attribute_models = {}
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Jebao Aqua from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
 
-    def _load_model(file_path):
-        """Load a single model file."""
-        with open(file_path, "r") as file:
-            model = json.load(file)
-            return model["product_key"], model
-
-    # Load all model files in executor
-    for model_file in models_path.glob("*.json"):
-        try:
-            product_key, model = await hass.async_add_executor_job(
-                _load_model, model_file
-            )
-            attribute_models[product_key] = model
-        except Exception as e:
-            LOGGER.error(f"Error loading model file {model_file}: {e}")
-
-    return attribute_models
-
-
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Set up Jebao Pump from a config entry."""
     token = entry.data.get("token")
-    region = entry.data.get("region")  # Get region from config entry
+    region = entry.data.get("region")
 
     if not token or not region:
         LOGGER.error("API token or region not found in configuration entry")
         return False
 
     # Load attribute models asynchronously
-    attribute_models = await load_attribute_models(hass)
-    LOGGER.debug(f"Setting up API object with token: {token} and region: {region}")
+    attribute_models = await _load_attribute_models(hass)
 
     # Initialize API with correct regional URLs
     api = GizwitsApi(
@@ -69,218 +50,342 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         control_url=GIZWITS_API_URLS[region]["CONTROL_URL"],
         token=token,
     )
+    await api.async_init_session()
+    api.add_attribute_models(attribute_models)
 
-    async with api:
-        api.add_attribute_models(attribute_models)
-        coordinator = GizwitsDataUpdateCoordinator(hass, api)
-        await coordinator.fetch_initial_device_list(entry)
+    coordinator = GizwitsDataUpdateCoordinator(hass, api, entry)
+    await coordinator.fetch_initial_device_list()
 
+    try:
+        await coordinator.async_config_entry_first_refresh()
+    except Exception as err:
+        await api.async_close_session()
+        LOGGER.error("Error setting up entry: %s", err)
+        raise ConfigEntryNotReady from err
+
+    hass.data[DOMAIN][entry.entry_id] = {
+        "api": api,
+        "coordinator": coordinator,
+        "attribute_models": attribute_models,
+    }
+
+    # Resolve missing product key mappings after we have device data
+    _resolve_missing_models(coordinator, attribute_models)
+
+    # Auto-discover devices and update coordinator with discovered IPs
+    if entry.data.get("auto_discover", True):
+        await _auto_discover_devices(hass, entry, coordinator)
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Register services (once, for the first entry)
+    if len(hass.data[DOMAIN]) == 1:
+        await async_setup_services(hass)
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    if unload_ok:
+        data = hass.data[DOMAIN].pop(entry.entry_id, {})
+        api: GizwitsApi | None = data.get("api")
+        if api:
+            await api.async_close_session()
+
+        # Unregister services when last entry removed
+        if not hass.data[DOMAIN]:
+            await async_unload_services(hass)
+
+    return unload_ok
+
+
+async def _load_attribute_models(hass: HomeAssistant) -> dict:
+    """Load attribute models from JSON files."""
+    models_path = Path(hass.config.path("custom_components/jebao_aqua/models"))
+    attribute_models: dict = {}
+
+    def _load_model(file_path: Path) -> tuple[str, dict]:
+        with open(file_path, encoding="utf-8") as file:
+            model = json.load(file)
+            return model["product_key"], model
+
+    for model_file in models_path.glob("*.json"):
         try:
-            await coordinator.async_config_entry_first_refresh()
-        except Exception as err:
-            LOGGER.error("Error setting up entry: %s", err)
-            raise ConfigEntryNotReady from err
+            product_key, model = await hass.async_add_executor_job(
+                _load_model, model_file
+            )
+            attribute_models[product_key] = model
+        except Exception:
+            LOGGER.exception("Error loading model file %s", model_file.name)
 
-        hass.data[DOMAIN][entry.entry_id] = {
-            "api": api,
-            "coordinator": coordinator,
-            "attribute_models": attribute_models,
-        }
+    LOGGER.debug("Loaded %d attribute models", len(attribute_models))
+    return attribute_models
 
-        # Auto-discover devices and update config entry if needed
-        if entry.data.get("auto_discover", True):  # Default to True if not specified
-            discovered_devices = await discover_devices()
-            if discovered_devices:
-                hass.data[DOMAIN][entry.entry_id]["discovered_devices"] = (
-                    discovered_devices
-                )
-                LOGGER.debug(f"Discovered devices during setup: {discovered_devices}")
 
-                # Update coordinator's device inventory with discovered IPs
-                for device in coordinator.device_inventory:
-                    device_id = device.get("did")
-                    if device_id in discovered_devices:
-                        device["lan_ip"] = discovered_devices[device_id]
-                        LOGGER.debug(
-                            f"Updated device {device_id} with discovered IP {discovered_devices[device_id]}"
-                        )
+def _match_model_by_attrs(
+    attribute_models: dict, cloud_product_key: str, device_attr_names: set[str]
+) -> dict | None:
+    """Match a cloud device to an APK model by attribute name overlap.
 
-        # Replace multiple async_forward_entry_setup calls with single async_forward_entry_setups
-        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    Cloud product keys often differ from APK-bundled keys.
+    We find the model whose attributes best match the device's actual data.
+    """
+    if not device_attr_names:
+        return None
 
-        return True
+    best_match: dict | None = None
+    best_score = 0
+
+    for _pk, model in attribute_models.items():
+        # Get model attrs from either format
+        attrs = model.get("attrs", [])
+        if not attrs:
+            entities = model.get("entities", [])
+            if entities:
+                attrs = entities[0].get("attrs", [])
+
+        model_attr_names = {a["name"] for a in attrs}
+        overlap = len(device_attr_names & model_attr_names)
+
+        if overlap > best_score:
+            best_score = overlap
+            best_match = model
+
+    if best_match and best_score >= 3:  # At least 3 matching attrs
+        LOGGER.info(
+            "Matched cloud pk %s to model '%s' (%d/%d attrs overlap)",
+            cloud_product_key[:12],
+            best_match.get("name", "?"),
+            best_score,
+            len(device_attr_names),
+        )
+        return best_match
+
+    LOGGER.warning(
+        "No model match for cloud pk %s (best overlap: %d)",
+        cloud_product_key[:12],
+        best_score,
+    )
+    return None
+
+
+def _resolve_missing_models(
+    coordinator: GizwitsDataUpdateCoordinator,
+    attribute_models: dict,
+) -> None:
+    """Resolve cloud product keys to APK models by attribute matching.
+
+    Cloud-assigned product keys often differ from APK-bundled ones.
+    After the first data fetch, we have the actual attribute names from
+    each device and can match them to APK models.
+    """
+    for device in coordinator.device_inventory:
+        pk = device.get("product_key")
+        if not pk or pk in attribute_models:
+            continue
+
+        device_id = device.get("did")
+        if not device_id:
+            continue
+
+        # Get actual attribute names from coordinator data
+        device_data = coordinator.device_data.get(device_id, {})
+        attr_dict = device_data.get("attr", {})
+        if not attr_dict:
+            LOGGER.debug(
+                "No cloud data yet for %s, skipping model resolution", device_id
+            )
+            continue
+
+        attr_names = set(attr_dict.keys())
+        matched_model = _match_model_by_attrs(attribute_models, pk, attr_names)
+
+        if matched_model:
+            # Register the cloud product key as an alias
+            attribute_models[pk] = matched_model
+            LOGGER.info(
+                "Resolved device %s (pk=%s) -> model '%s'",
+                device.get("dev_alias", device_id),
+                pk[:12],
+                matched_model.get("name", "?"),
+            )
+
+
+async def _auto_discover_devices(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: GizwitsDataUpdateCoordinator,
+) -> None:
+    """Auto-discover devices on the LAN and update coordinator."""
+    try:
+        discovered_devices = await discover_devices()
+    except Exception:
+        LOGGER.debug("Device discovery failed, continuing without")
+        return
+
+    if not discovered_devices:
+        return
+
+    hass.data[DOMAIN][entry.entry_id]["discovered_devices"] = discovered_devices
+    LOGGER.debug("Discovered %d devices during setup", len(discovered_devices))
+
+    for device in coordinator.device_inventory:
+        device_id = device.get("did")
+        if device_id and device_id in discovered_devices:
+            device["lan_ip"] = discovered_devices[device_id]
+            LOGGER.debug(
+                "Updated device %s with discovered IP %s",
+                device_id,
+                discovered_devices[device_id],
+            )
 
 
 class GizwitsDataUpdateCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass, api):
-        """Initialize."""
-        super().__init__(hass, LOGGER, name=DOMAIN, update_interval=UPDATE_INTERVAL)
-        self.api = api
-        self.device_inventory = []
-        self.device_data = {}
-        self._device_update_locks = {}  # Add locks per device
+    """Data update coordinator for Jebao devices."""
 
-    async def fetch_initial_device_list(self, entry: ConfigEntry):
-        """Fetch the initial list of devices and add LAN IPs."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: GizwitsApi,
+        entry: ConfigEntry,
+    ) -> None:
+        """Initialize."""
+        super().__init__(
+            hass,
+            LOGGER,
+            name=DOMAIN,
+            update_interval=UPDATE_INTERVAL,
+        )
+        self.api = api
+        self.entry = entry
+        self.device_inventory: list[dict] = []
+        self.device_data: dict[str, dict] = {}
+        self._device_update_locks: dict[str, asyncio.Lock] = {}
+        self._lan_failure_counts: dict[str, int] = {}
+
+    async def fetch_initial_device_list(self) -> None:
+        """Fetch the initial list of devices and add LAN IPs from config."""
         try:
             response = await self.api.get_devices()
-            if response and "devices" in response:
-                self.device_inventory = response["devices"]
+            if not response or "devices" not in response:
+                LOGGER.error("No 'devices' key in API response")
+                return
 
-                # Add LAN IPs from ConfigEntry
-                config_devices = entry.data.get("devices", [])
-                for device in self.device_inventory:
-                    device_id = device.get("did")
-                    # Find matching device in config entry data
-                    matching_device = next(
-                        (d for d in config_devices if d.get("did") == device_id), None
-                    )
-                    if matching_device:
-                        device["lan_ip"] = matching_device.get("lan_ip")
+            self.device_inventory = response["devices"]
 
-                LOGGER.debug(
-                    f"Fetched device list with LAN IPs: {self.device_inventory}"
+            # Merge LAN IPs from ConfigEntry
+            config_devices = self.entry.data.get("devices", [])
+            for device in self.device_inventory:
+                device_id = device.get("did")
+                matching = next(
+                    (d for d in config_devices if d.get("did") == device_id),
+                    None,
                 )
-            else:
-                LOGGER.error("No 'devices' key in response")
-        except Exception as e:
-            LOGGER.error(f"Error fetching initial device list: {e}")
+                if matching:
+                    device["lan_ip"] = matching.get("lan_ip")
 
-    async def get_device_data(self, device_id):
-        """Get device data either locally or from the cloud with lock protection."""
-        # Get or create lock for this device
+            LOGGER.debug("Fetched %d devices from cloud", len(self.device_inventory))
+        except Exception:
+            LOGGER.exception("Error fetching initial device list")
+
+    async def _get_device_data(self, device_id: str) -> dict | None:
+        """Get device data with LAN-first, cloud-fallback strategy."""
         if device_id not in self._device_update_locks:
             self._device_update_locks[device_id] = asyncio.Lock()
 
         async with self._device_update_locks[device_id]:
             device_info = next(
-                (
-                    device
-                    for device in self.device_inventory
-                    if device["did"] == device_id
-                ),
+                (d for d in self.device_inventory if d["did"] == device_id),
                 None,
             )
-            if device_info and "lan_ip" in device_info:
-                LOGGER.debug(
-                    f"Getting local data for device {device_id} at {device_info['lan_ip']}"
-                )
-                data = await self.api.get_local_device_data(
-                    device_info["lan_ip"], device_info["product_key"], device_id
-                )
-            else:
-                LOGGER.debug(f"Getting cloud data for device {device_id}")
-                data = await self.api.get_device_data(device_id)
 
-            if data:
-                LOGGER.debug(f"Got data for device {device_id}: {data}")
-            return data
+            # Try LAN first if we have an IP and haven't exceeded failure threshold
+            lan_ip = device_info.get("lan_ip") if device_info else None
+            lan_failures = self._lan_failure_counts.get(device_id, 0)
 
-    async def _async_update_data(self):
-        """Fetch the latest status for each device."""
-        new_data = {}
-
-        async def update_single_device(device_id: str):
-            """Update a single device's data."""
-            try:
-                device_data = await self.get_device_data(device_id)
-                if device_data and isinstance(device_data.get("attr"), dict):
-                    LOGGER.debug(
-                        f"Got fresh data for device {device_id}: {device_data}"
+            if lan_ip and lan_failures < MAX_LAN_FAILURES:
+                try:
+                    data = await self.api.get_local_device_data(
+                        lan_ip,
+                        device_info["product_key"],
+                        device_id,
                     )
+                    if data:
+                        self._lan_failure_counts[device_id] = 0
+                        return data
+                except Exception:
+                    self._lan_failure_counts[device_id] = lan_failures + 1
+                    LOGGER.debug(
+                        "LAN poll failed for %s (%d/%d), falling back to cloud",
+                        device_id,
+                        lan_failures + 1,
+                        MAX_LAN_FAILURES,
+                    )
+
+            # Cloud fallback
+            try:
+                data = await self.api.get_device_data(device_id)
+                if data:
+                    # Reset LAN failure count on successful cloud poll
+                    # so we retry LAN next cycle
+                    if lan_failures >= MAX_LAN_FAILURES:
+                        self._lan_failure_counts[device_id] = 0
+                        LOGGER.debug(
+                            "Cloud poll succeeded for %s, will retry LAN",
+                            device_id,
+                        )
+                    return data
+            except Exception:
+                LOGGER.debug("Cloud poll also failed for %s", device_id)
+
+            return None
+
+    async def _async_update_data(self) -> dict[str, dict]:
+        """Fetch the latest status for each device."""
+        new_data: dict[str, dict] = {}
+
+        async def _update_single(device_id: str) -> tuple[str | None, dict | None]:
+            try:
+                device_data = await self._get_device_data(device_id)
+                if device_data and isinstance(device_data.get("attr"), dict):
                     return device_id, device_data
-                elif device_id in self.device_data:
-                    LOGGER.warning(f"Using cached data for device {device_id}")
+                if device_id in self.device_data:
+                    LOGGER.debug("Using cached data for device %s", device_id)
                     return device_id, self.device_data[device_id]
-                else:
-                    LOGGER.warning(f"No valid data for device {device_id}")
-                    return None, None
-            except Exception as e:
-                LOGGER.error(f"Error updating device {device_id}: {e}")
+                LOGGER.warning("No valid data for device %s", device_id)
+                return None, None
+            except Exception:
+                LOGGER.exception("Error updating device %s", device_id)
                 if device_id in self.device_data:
                     return device_id, self.device_data[device_id]
                 return None, None
 
-        # Create tasks for all devices
-        tasks = []
-        for device in self.device_inventory:
-            if device_id := device.get("did"):
-                tasks.append(update_single_device(device_id))
+        tasks = [
+            _update_single(device["did"])
+            for device in self.device_inventory
+            if device.get("did")
+        ]
 
-        # Wait for all updates to complete
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=False)
-
-            # Process results and log them
             for device_id, data in results:
                 if device_id and data:
                     new_data[device_id] = data
-                    LOGGER.debug(
-                        f"Successfully updated device {device_id} with data: {data}"
-                    )
 
         if not new_data:
-            LOGGER.error("No device data was updated successfully")
-            # Instead of raising UpdateFailed, return last known good data if available
             if self.device_data:
-                LOGGER.warning("Using last known good data")
+                LOGGER.warning("No fresh data, using last known good data")
                 return self.device_data
             raise UpdateFailed("Failed to update any devices")
 
-        LOGGER.debug(f"Final update data for all devices: {new_data}")
         self.device_data = new_data
         return new_data
 
     async def async_config_entry_first_refresh(self) -> None:
-        """Perform first refresh and make sure we get valid data."""
+        """Perform first refresh and validate data."""
         await self._async_refresh(log_failures=True)
-        # Verify we have valid data after first refresh
-        if not any(is_device_data_valid(data) for data in self.device_data.values()):
+        if not any(is_device_data_valid(d) for d in self.device_data.values()):
             raise ConfigEntryNotReady("No valid device data received during setup")
-
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    try:
-        # First unload the platforms
-        unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-
-        if unload_ok:
-            # Clean up the entity registry
-            ent_reg = async_get_entity_registry(hass)
-            entities = [
-                entry_id
-                for entry_id, entity_entry in ent_reg.entities.items()
-                if entity_entry.config_entry_id == entry.entry_id
-            ]
-
-            # Remove all entities
-            for entity_id in entities:
-                ent_reg.async_remove(entity_id)
-
-            # Clean up the device registry
-            dev_reg = async_get_device_registry(hass)
-            devices = [
-                device_entry.id
-                for device_entry in dev_reg.devices.values()
-                if entry.entry_id in device_entry.config_entries
-            ]
-
-            # Remove all devices
-            for device_id in devices:
-                dev_reg.async_remove_device(device_id)
-
-            # Clean up hass.data
-            if DOMAIN in hass.data and entry.entry_id in hass.data[DOMAIN]:
-                hass.data[DOMAIN].pop(entry.entry_id)
-
-        return unload_ok
-    except Exception as ex:
-        LOGGER.error(f"Error unloading entry: {ex}")
-        return False
-
-
-async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the config entry."""
-    await async_unload_entry(hass, entry)
-    await async_setup_entry(hass, entry)
