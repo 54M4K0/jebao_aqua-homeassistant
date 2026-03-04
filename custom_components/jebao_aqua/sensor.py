@@ -72,8 +72,10 @@ async def async_setup_entry(
         entities.append(JebaoFirmwareVersionSensor(coordinator, device))
         entities.append(JebaoOnlineStatusSensor(coordinator, device))
 
-        # --- Dosing status sensors (per active channel) ---
-        for ch in range(1, 9):
+        # --- Dosing status sensors (only for active channels per channelTTL) ---
+        device_data = (coordinator.data or {}).get(device_id, {})
+        channel_count = int(device_data.get("channelTTL", 0)) or 8
+        for ch in range(1, channel_count + 1):
             entities.append(JebaoDosingSensor(coordinator, device, ch))
 
     if entities:
@@ -138,9 +140,9 @@ class JebaoDeviceClockSensor(CoordinatorEntity, SensorEntity):
         super().__init__(coordinator)
         self._device = device
         self._device_id = device["did"]
-        self._attr_name = "Device Clock"
-        self._attr_unique_id = make_unique_id(self._device_id, "device_clock")
-        self.entity_id = make_entity_id("sensor", self._device_id, "device_clock")
+        self._attr_name = "Last Sync"
+        self._attr_unique_id = make_unique_id(self._device_id, "last_sync")
+        self.entity_id = make_entity_id("sensor", self._device_id, "last_sync")
 
     @property
     def device_info(self):
