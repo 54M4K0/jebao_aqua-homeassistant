@@ -41,6 +41,8 @@ async def async_setup_entry(
             continue
 
         for attr in get_model_attrs(model):
+            if is_hidden_attr(attr.get("name", "")):
+                continue
             if (
                 attr.get("type") == "status_writable"
                 and attr.get("data_type") == "uint8"

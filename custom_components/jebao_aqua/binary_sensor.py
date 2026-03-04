@@ -42,6 +42,8 @@ async def async_setup_entry(
             continue
 
         for attr in get_model_attrs(model):
+            if is_hidden_attr(attr.get("name", "")):
+                continue
             if attr.get("type") == "fault" and attr.get("data_type") == "bool":
                 entities.append(JebaoPumpFaultSensor(coordinator, device, attr))
 
