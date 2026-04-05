@@ -105,21 +105,24 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def _load_attribute_models(hass: HomeAssistant) -> dict:
     """Load attribute models from JSON files."""
     models_path = Path(hass.config.path("custom_components/jebao_aqua/models"))
-    attribute_models: dict = {}
+    def _load_models() -> tuple[dict[str, dict], list[tuple[str, str]]]:
+        attribute_models: dict[str, dict] = {}
+        failed_files: list[tuple[str, str]] = []
 
-    def _load_model(file_path: Path) -> tuple[str, dict]:
-        with open(file_path, encoding="utf-8") as file:
-            model = json.load(file)
-            return model["product_key"], model
+        for model_file in models_path.glob("*.json"):
+            try:
+                with model_file.open(encoding="utf-8") as file:
+                    model = json.load(file)
+                attribute_models[model["product_key"]] = model
+            except Exception as err:
+                failed_files.append((model_file.name, repr(err)))
 
-    for model_file in models_path.glob("*.json"):
-        try:
-            product_key, model = await hass.async_add_executor_job(
-                _load_model, model_file
-            )
-            attribute_models[product_key] = model
-        except Exception:
-            LOGGER.exception("Error loading model file %s", model_file.name)
+        return attribute_models, failed_files
+
+    attribute_models, failed_files = await hass.async_add_executor_job(_load_models)
+
+    for file_name, err in failed_files:
+        LOGGER.error("Error loading model file %s: %s", file_name, err)
 
     LOGGER.debug("Loaded %d attribute models", len(attribute_models))
     return attribute_models
